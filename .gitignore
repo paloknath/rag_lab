@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project data (generated at runtime)
+vector_store/
+graph_store/
+chroma_db/
+
+# Project docs (local only)
+CLAUDE.md
+PLAN.md
+
+# Claude Code
+.claude/

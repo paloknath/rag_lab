@@ -39,6 +39,15 @@ FABLE_SUMMARY_MAX_TOKENS = 200       # Max tokens for cluster summaries
 # ── MACER (Multi-Agent Iterative Retrieval) ─────────────────────
 MACER_MAX_ITERATIONS = 3             # Max retriever-constructor-reflector loops
 
+# ── LLM-as-a-Judge Evaluation ─────────────────────────────────
+JUDGE_BASE_URL = LLM_BASE_URL        # Judge LLM endpoint (same as main LLM for now)
+JUDGE_API_KEY = LLM_API_KEY          # Judge LLM API key
+JUDGE_MODEL_NAME = LLM_MODEL_NAME    # Judge model (swap to a stronger model if available)
+JUDGE_TEMPERATURE = 0.0              # Deterministic scoring
+JUDGE_MAX_TOKENS = 512               # Max output tokens for judge response
+JUDGE_CONTEXT_WINDOW = 16000         # Total context window budget in tokens
+JUDGE_MAX_CONTEXT_TOKENS = 12000     # Max tokens for retrieved context in judge prompt
+
 # ── LLM Generation ──────────────────────────────────────────────
 LLM_TEMPERATURE = 0.1
 LLM_MAX_TOKENS = 1024

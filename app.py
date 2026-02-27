@@ -123,6 +123,46 @@ def _display_metrics(metrics: dict, trace: list[str] | None = None):
                 st.text(step)
 
 
+def _display_evaluation(eval_data: dict):
+    """Render LLM-as-a-Judge evaluation scores in an expander."""
+    from evaluation import EvaluationResult
+
+    eval_result = EvaluationResult.from_dict(eval_data)
+
+    with st.expander("📝 LLM-as-a-Judge Evaluation", expanded=False):
+        if eval_result.error:
+            st.warning(f"Evaluation error: {eval_result.error}")
+            return
+
+        metrics = [
+            eval_result.context_relevance,
+            eval_result.context_sufficiency,
+            eval_result.faithfulness,
+            eval_result.answer_relevance,
+        ]
+        applicable = [m for m in metrics if m.applicable]
+
+        cols = st.columns(len(applicable))
+        for col, metric in zip(cols, applicable):
+            with col:
+                if metric.score is not None:
+                    emoji = "🟢" if metric.score >= 4 else "🟡" if metric.score >= 3 else "🔴"
+                    st.metric(metric.name, f"{emoji} {metric.score}/5")
+                else:
+                    st.metric(metric.name, "N/A")
+
+        for metric in applicable:
+            if metric.score is not None:
+                st.caption(f"**{metric.name}**: {metric.reason}")
+
+        not_applicable = [m for m in metrics if not m.applicable]
+        if not_applicable:
+            names = ", ".join(m.name for m in not_applicable)
+            st.caption(f"_{names}: Not applicable (no retrieval performed)_")
+
+        st.caption(f"Judge latency: {eval_result.latency:.2f}s")
+
+
 # ── Cached Resources ─────────────────────────────────────────────
 
 @st.cache_resource
@@ -297,6 +337,16 @@ with st.sidebar:
 
     st.divider()
 
+    # --- Evaluation Settings ---
+    st.subheader("📝 Evaluation")
+    enable_evaluation = st.toggle(
+        "LLM-as-a-Judge",
+        value=False,
+        help="Run automatic quality evaluation after each query using the LLM as judge. Adds ~3-6s latency.",
+    )
+
+    st.divider()
+
     if st.button("🗑️ Clear Chat", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
@@ -312,6 +362,8 @@ for msg in st.session_state.messages:
         st.markdown(msg["content"])
         if msg["role"] == "assistant" and "metrics" in msg:
             _display_metrics(msg["metrics"], msg.get("trace"))
+        if msg["role"] == "assistant" and "evaluation" in msg:
+            _display_evaluation(msg["evaluation"])
 
 # Handle new user input
 if prompt := st.chat_input("Ask a question about your documents..."):
@@ -413,10 +465,25 @@ if prompt := st.chat_input("Ask a question about your documents..."):
         if metrics:
             _display_metrics(metrics, trace)
 
+        # Run LLM-as-a-Judge evaluation if enabled
+        eval_result = None
+        if enable_evaluation and answer:
+            with st.spinner("Evaluating response quality..."):
+                from evaluation import evaluate_rag_response
+                eval_result = evaluate_rag_response(
+                    query=prompt,
+                    context=result.context if result else "",
+                    answer=answer,
+                    strategy=rag_mode,
+                )
+            _display_evaluation(eval_result.to_dict())
+
         # Persist to session state
         msg_data = {"role": "assistant", "content": answer}
         if metrics:
             msg_data["metrics"] = metrics
         if trace:
             msg_data["trace"] = trace
+        if eval_result:
+            msg_data["evaluation"] = eval_result.to_dict()
         st.session_state.messages.append(msg_data)

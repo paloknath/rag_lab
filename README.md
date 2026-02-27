@@ -84,8 +84,8 @@ retrievers.py     → Strategy pattern: BaseRetriever + 5 implementations
 Edit `config.py` to change:
 
 ```python
-LLM_BASE_URL = "http://localhost:1234/v1"   # Your LLM endpoint
-LLM_MODEL_NAME = "qwen2.5-7b-instruct"      # Your model name
+LLM_BASE_URL = "http://localhost:1234/v1"   # Any OpenAI-compatible endpoint
+LLM_MODEL_NAME = "your-model-name"           # Model loaded in your LLM server
 CHILD_CHUNK_SIZE = 300                        # Tokens for search index
 PARENT_CHUNK_SIZE = 800                       # Tokens for LLM context
 TOP_K_RETRIEVAL = 10                          # Initial candidates

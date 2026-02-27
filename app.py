@@ -1,6 +1,6 @@
 """
 RAG Playground — Streamlit entry point.
-Compare four retrieval strategies: No RAG, Vector RAG, Graph RAG, Agentic RAG.
+Compare seven retrieval strategies side-by-side.
 """
 
 import os
@@ -76,13 +76,49 @@ def _display_metrics(metrics: dict, trace: list[str] | None = None):
                 f"Reranked: {meta.get('reranked', False)}"
             )
 
+        # FABLE details
+        if "topdown_leaves" in meta:
+            st.caption(
+                f"🌲 Top-down: {meta['topdown_leaves']} leaves | "
+                f"Bottom-up: {meta['bottomup_leaves']} leaves | "
+                f"Merged: {meta['merged_parents']} parents"
+            )
+            if meta.get("cluster_summaries_used", 0) > 0:
+                st.caption(f"📋 Cluster summaries: {meta['cluster_summaries_used']}")
+            st.caption(
+                f"🔀 Branches: {meta.get('branches_explored', '?')} | "
+                f"Levels: {meta.get('hierarchy_levels', '?')}"
+            )
+
+        # MACER details
+        if "iterations_completed" in meta:
+            st.caption(
+                f"🔄 Iterations: {meta['iterations_completed']}/{meta['max_iterations']} | "
+                f"Termination: {meta.get('termination_reason', 'unknown')}"
+            )
+            st.caption(
+                f"📝 Facts: {meta.get('total_facts', 0)} | "
+                f"LLM calls: {meta.get('total_llm_calls', 0)}"
+            )
+            if meta.get("facts"):
+                with st.expander("📋 Extracted Facts", expanded=False):
+                    for fact in meta["facts"]:
+                        st.text(f"• {fact}")
+
         # Errors
         if "error" in meta:
             st.warning(meta["error"])
 
-    # Agent trace shown separately
+    # Trace display (context-aware label)
     if trace:
-        with st.expander("🤖 Agent Trace", expanded=False):
+        strategy = metrics.get("strategy", "")
+        if "FABLE" in strategy:
+            trace_label = "🌲 Hierarchy Navigation Trace"
+        elif "MACER" in strategy:
+            trace_label = "🔄 Iteration Trace"
+        else:
+            trace_label = "🤖 Agent Trace"
+        with st.expander(trace_label, expanded=False):
             for step in trace:
                 st.text(step)
 
@@ -160,7 +196,8 @@ with st.sidebar:
 
         st.success(
             f"✅ {stats['num_parents']} parents, {stats['num_children']} children, "
-            f"{stats['num_triplets']} triplets, {stats['num_nodes']} graph nodes"
+            f"{stats['num_triplets']} triplets, {stats['num_nodes']} graph nodes, "
+            f"{stats.get('fable_clusters', 0)} FABLE clusters"
         )
 
     if clear_btn:
@@ -194,14 +231,19 @@ with st.sidebar:
 
     rag_mode = st.selectbox(
         "Retrieval Mode",
-        options=["No RAG", "Vector RAG", "Graph RAG", "Vector + Graph RAG", "Agentic RAG"],
+        options=[
+            "No RAG", "Vector RAG", "Graph RAG", "Vector + Graph RAG",
+            "Agentic RAG", "FABLE RAG", "MACER RAG",
+        ],
         index=1,
         help=(
             "**No RAG**: Direct LLM call\n\n"
             "**Vector RAG**: Hybrid vector+BM25 search with optional reranking\n\n"
             "**Graph RAG**: Knowledge graph entity traversal\n\n"
             "**Vector + Graph RAG**: Combined vector search + graph traversal\n\n"
-            "**Agentic RAG**: Autonomous agent with multiple tools"
+            "**Agentic RAG**: Autonomous agent with multiple tools\n\n"
+            "**FABLE RAG**: Hierarchical bi-path retrieval (top-down + bottom-up)\n\n"
+            "**MACER RAG**: Multi-agent iterative context evolution loop"
         ),
     )
 
@@ -209,8 +251,10 @@ with st.sidebar:
     use_reranker = False
     hybrid_alpha = config.HYBRID_ALPHA_DEFAULT
     graph_hops = config.GRAPH_HOPS_DEFAULT
+    fable_branches = config.FABLE_TOP_K_BRANCHES
+    macer_iterations = config.MACER_MAX_ITERATIONS
 
-    if rag_mode in ("Vector RAG", "Vector + Graph RAG"):
+    if rag_mode in ("Vector RAG", "Vector + Graph RAG", "FABLE RAG", "MACER RAG"):
         use_reranker = st.toggle(
             "Cross-Encoder Reranking", value=True,
             help="Rerank top results using a cross-encoder model for better precision.",
@@ -222,13 +266,31 @@ with st.sidebar:
             help="1.0 = pure vector search, 0.0 = pure BM25 keyword search",
         )
 
-    if rag_mode in ("Graph RAG", "Vector + Graph RAG"):
+    if rag_mode in ("Graph RAG", "Vector + Graph RAG", "MACER RAG"):
         graph_hops = st.slider(
             "Graph Traversal Hops",
             min_value=1, max_value=3,
             value=config.GRAPH_HOPS_DEFAULT, step=1,
             help="Number of hops from matched entities. More hops = broader context but may include less relevant info.",
         )
+
+    if rag_mode == "FABLE RAG":
+        fable_branches = st.slider(
+            "Top-Down Branches",
+            min_value=1, max_value=5,
+            value=config.FABLE_TOP_K_BRANCHES, step=1,
+            help="Number of hierarchy branches to explore in the top-down semantic path.",
+        )
+        st.info("Bi-path: semantic top-down + structural bottom-up hierarchy navigation", icon="🌲")
+
+    if rag_mode == "MACER RAG":
+        macer_iterations = st.slider(
+            "Max Iterations",
+            min_value=1, max_value=5,
+            value=config.MACER_MAX_ITERATIONS, step=1,
+            help="Maximum retriever-constructor-reflector loops before forcing a response.",
+        )
+        st.info("Four-agent loop: Retriever -> Constructor -> Reflector -> Response", icon="🔄")
 
     if rag_mode == "Agentic RAG":
         st.info("The agent will autonomously choose which tools to use.", icon="🤖")
@@ -260,7 +322,10 @@ if prompt := st.chat_input("Ask a question about your documents..."):
 
     # Generate assistant response
     with st.chat_message("assistant"):
-        needs_data = rag_mode in ("Vector RAG", "Graph RAG", "Vector + Graph RAG", "Agentic RAG")
+        needs_data = rag_mode in (
+            "Vector RAG", "Graph RAG", "Vector + Graph RAG",
+            "Agentic RAG", "FABLE RAG", "MACER RAG",
+        )
 
         if needs_data and not st.session_state.ingested:
             st.warning("⚠️ Please ingest documents first for this retrieval mode.")
@@ -275,7 +340,6 @@ if prompt := st.chat_input("Ask a question about your documents..."):
             retriever = get_retriever(rag_mode, embedding_model, cross_encoder)
 
             if rag_mode == "Agentic RAG":
-                # Show agent thinking process via st.status
                 with st.status("🤖 Agent thinking...", expanded=True) as agent_status:
                     result = retriever.retrieve(prompt, alpha=hybrid_alpha)
                     if result.trace:
@@ -285,8 +349,46 @@ if prompt := st.chat_input("Ask a question about your documents..."):
                         label=f"Agent complete ({result.latency:.2f}s)",
                         state="complete",
                     )
-                # Always generate a synthesized answer from the gathered context
                 answer = retriever.generate_answer(prompt, result.context)
+
+            elif rag_mode == "FABLE RAG":
+                if not os.path.exists(config.FABLE_HIERARCHY_PATH):
+                    st.warning("FABLE hierarchy not found. Please re-ingest documents.")
+                    answer = "Please re-ingest documents to build the FABLE hierarchy."
+                    result = None
+                else:
+                    with st.status("🌲 FABLE: navigating hierarchy...", expanded=True) as fable_status:
+                        result = retriever.retrieve(
+                            prompt, alpha=hybrid_alpha, use_reranker=use_reranker,
+                            top_k_branches=fable_branches,
+                        )
+                        if result.trace:
+                            for step in result.trace:
+                                st.text(step)
+                        fable_status.update(
+                            label=f"FABLE complete ({result.latency:.2f}s)",
+                            state="complete",
+                        )
+                    answer = retriever.generate_answer(prompt, result.context)
+
+            elif rag_mode == "MACER RAG":
+                with st.status("🔄 MACER: iterating...", expanded=True) as macer_status:
+                    result = retriever.retrieve(
+                        prompt, alpha=hybrid_alpha, use_reranker=use_reranker,
+                        hops=graph_hops, max_iterations=macer_iterations,
+                    )
+                    if result.trace:
+                        for step in result.trace:
+                            st.text(step)
+                    macer_status.update(
+                        label=(
+                            f"MACER complete ({result.latency:.2f}s, "
+                            f"{result.metadata.get('iterations_completed', '?')} iterations)"
+                        ),
+                        state="complete",
+                    )
+                answer = retriever.generate_answer(prompt, result.context)
+
             else:
                 result = retriever.retrieve(
                     prompt, alpha=hybrid_alpha, use_reranker=use_reranker,
@@ -294,13 +396,17 @@ if prompt := st.chat_input("Ask a question about your documents..."):
                 )
                 answer = retriever.generate_answer(prompt, result.context)
 
-            metrics = {
-                "latency": result.latency,
-                "num_chunks": result.num_chunks,
-                "strategy": result.strategy,
-                "metadata": result.metadata,
-            }
-            trace = result.trace
+            if result:
+                metrics = {
+                    "latency": result.latency,
+                    "num_chunks": result.num_chunks,
+                    "strategy": result.strategy,
+                    "metadata": result.metadata,
+                }
+                trace = result.trace
+            else:
+                metrics = None
+                trace = None
 
         st.markdown(answer)
 

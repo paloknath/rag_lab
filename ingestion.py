@@ -14,8 +14,11 @@ from typing import Callable
 import chromadb
 import fitz  # PyMuPDF
 import networkx as nx
+import numpy as np
 import tiktoken
 from openai import OpenAI
+from scipy.cluster.hierarchy import fcluster, linkage
+from scipy.spatial.distance import pdist
 from sentence_transformers import SentenceTransformer
 
 import config
@@ -268,6 +271,208 @@ def load_graph() -> nx.DiGraph:
     return nx.DiGraph()
 
 
+# ── FABLE Hierarchy Building ─────────────────────────────────────
+
+CLUSTER_SUMMARY_PROMPT = """Summarize the following group of text passages into a single concise paragraph
+that captures the main topics, entities, and relationships discussed.
+
+Passages:
+{texts}
+
+Concise summary:"""
+
+
+def _llm_summarize(text: str, llm_client: OpenAI) -> str:
+    """Generate a concise summary of text using the LLM."""
+    response = llm_client.chat.completions.create(
+        model=config.LLM_MODEL_NAME,
+        messages=[
+            {"role": "system", "content": "You are a concise summarizer. Produce a single paragraph summary."},
+            {"role": "user", "content": CLUSTER_SUMMARY_PROMPT.format(texts=text)},
+        ],
+        temperature=0.0,
+        max_tokens=config.FABLE_SUMMARY_MAX_TOKENS,
+        seed=random.randint(0, 2**31),
+    )
+    return response.choices[0].message.content.strip()
+
+
+def build_fable_hierarchy(
+    children: list[ChildChunk],
+    embedding_model: SentenceTransformer,
+    llm_client: OpenAI,
+    progress_callback: Callable[[str], None] | None = None,
+) -> dict:
+    """
+    Build a hierarchical clustering tree over child chunks for FABLE retrieval.
+
+    Steps:
+    1. Encode all child chunks with the embedding model
+    2. Agglomerative clustering at level 0 (leaf clusters)
+    3. LLM-summarize each cluster
+    4. If NUM_LEVELS >= 2, cluster the summaries into super-clusters
+    5. Persist hierarchy to JSON
+
+    Returns the hierarchy dict.
+    """
+    if len(children) < 2:
+        hierarchy = {
+            "levels": 1,
+            "root": {
+                "summary": children[0].text if children else "",
+                "summary_embedding": [],
+                "children": [],
+            },
+            "clusters": {},
+            "child_to_cluster": {},
+        }
+        _ensure_dir(config.FABLE_HIERARCHY_PATH)
+        _save_json(config.FABLE_HIERARCHY_PATH, hierarchy)
+        return hierarchy
+
+    if progress_callback:
+        progress_callback("Building FABLE hierarchy: computing embeddings...")
+
+    # Step 1: Get embeddings for all children
+    child_texts = [c.text for c in children]
+    child_ids = [c.child_id for c in children]
+    embeddings = embedding_model.encode(child_texts, show_progress_bar=False)
+
+    # Step 2: Level-0 clustering
+    n_clusters_l0 = min(
+        config.FABLE_MAX_CLUSTERS,
+        max(2, len(children) // config.FABLE_MIN_CLUSTER_SIZE),
+    )
+    # Clamp to actual number of children
+    n_clusters_l0 = min(n_clusters_l0, len(children))
+
+    dist_matrix = pdist(embeddings, metric="cosine")
+    # Replace NaN distances (identical vectors) with 0
+    dist_matrix = np.nan_to_num(dist_matrix, nan=0.0)
+    Z = linkage(dist_matrix, method="average")
+    labels_l0 = fcluster(Z, t=n_clusters_l0, criterion="maxclust")
+
+    if progress_callback:
+        progress_callback(f"Building FABLE hierarchy: created {n_clusters_l0} level-0 clusters...")
+
+    # Group children by cluster label
+    clusters_l0: dict[int, list[int]] = {}
+    for idx, label in enumerate(labels_l0):
+        clusters_l0.setdefault(int(label), []).append(idx)
+
+    # Step 3: Summarize each level-0 cluster
+    cluster_data: dict[str, dict] = {}
+    child_to_cluster: dict[str, str] = {}
+    l0_cluster_ids: list[str] = []
+    l0_summaries: list[str] = []
+    l0_embeddings: list = []
+
+    for label, indices in sorted(clusters_l0.items()):
+        cluster_id = f"cluster_0_{label}"
+        l0_cluster_ids.append(cluster_id)
+
+        cluster_child_ids = [child_ids[i] for i in indices]
+        cluster_texts = [child_texts[i] for i in indices]
+
+        for cid in cluster_child_ids:
+            child_to_cluster[cid] = cluster_id
+
+        if progress_callback:
+            progress_callback(f"Summarizing cluster {cluster_id} ({len(indices)} chunks)...")
+
+        combined = "\n\n---\n\n".join(cluster_texts)[:3000]
+        summary = _llm_summarize(combined, llm_client)
+        summary_emb = embedding_model.encode(summary, show_progress_bar=False).tolist()
+
+        l0_summaries.append(summary)
+        l0_embeddings.append(summary_emb)
+
+        cluster_data[cluster_id] = {
+            "level": 0,
+            "summary": summary,
+            "summary_embedding": summary_emb,
+            "children": [],
+            "leaf_child_ids": cluster_child_ids,
+        }
+
+    # Step 4: Level-1 clustering (if configured and enough clusters)
+    root_children = l0_cluster_ids
+
+    if config.FABLE_NUM_LEVELS >= 2 and len(l0_cluster_ids) >= 3:
+        if progress_callback:
+            progress_callback("Building FABLE hierarchy: level-1 super-clusters...")
+
+        l0_emb_array = np.array(l0_embeddings)
+        n_clusters_l1 = min(config.FABLE_MAX_CLUSTERS, max(2, len(l0_cluster_ids) // 2))
+
+        dist_l1 = pdist(l0_emb_array, metric="cosine")
+        dist_l1 = np.nan_to_num(dist_l1, nan=0.0)
+        Z_l1 = linkage(dist_l1, method="average")
+        labels_l1 = fcluster(Z_l1, t=n_clusters_l1, criterion="maxclust")
+
+        clusters_l1: dict[int, list[int]] = {}
+        for idx, label in enumerate(labels_l1):
+            clusters_l1.setdefault(int(label), []).append(idx)
+
+        l1_cluster_ids: list[str] = []
+        for label, indices in sorted(clusters_l1.items()):
+            cluster_id = f"cluster_1_{label}"
+            l1_cluster_ids.append(cluster_id)
+
+            sub_cluster_ids = [l0_cluster_ids[i] for i in indices]
+            sub_summaries = [l0_summaries[i] for i in indices]
+
+            combined = "\n\n---\n\n".join(sub_summaries)[:3000]
+            summary = _llm_summarize(combined, llm_client)
+            summary_emb = embedding_model.encode(summary, show_progress_bar=False).tolist()
+
+            all_leaf_ids = []
+            for scid in sub_cluster_ids:
+                all_leaf_ids.extend(cluster_data[scid]["leaf_child_ids"])
+
+            cluster_data[cluster_id] = {
+                "level": 1,
+                "summary": summary,
+                "summary_embedding": summary_emb,
+                "children": sub_cluster_ids,
+                "leaf_child_ids": all_leaf_ids,
+            }
+
+        root_children = l1_cluster_ids
+
+    # Step 5: Build root node
+    root_summary_parts = [cluster_data[cid]["summary"] for cid in root_children]
+    root_summary = _llm_summarize(
+        "\n\n---\n\n".join(root_summary_parts)[:3000], llm_client
+    )
+
+    hierarchy = {
+        "levels": config.FABLE_NUM_LEVELS,
+        "root": {
+            "summary": root_summary,
+            "summary_embedding": embedding_model.encode(root_summary, show_progress_bar=False).tolist(),
+            "children": root_children,
+        },
+        "clusters": cluster_data,
+        "child_to_cluster": child_to_cluster,
+    }
+
+    _ensure_dir(config.FABLE_HIERARCHY_PATH)
+    _save_json(config.FABLE_HIERARCHY_PATH, hierarchy)
+
+    if progress_callback:
+        progress_callback(f"FABLE hierarchy built: {len(cluster_data)} clusters across {config.FABLE_NUM_LEVELS} levels")
+
+    return hierarchy
+
+
+def load_fable_hierarchy() -> dict | None:
+    """Load FABLE hierarchy from JSON, or return None if not built."""
+    if os.path.exists(config.FABLE_HIERARCHY_PATH):
+        return _load_json(config.FABLE_HIERARCHY_PATH)
+    return None
+
+
 # ── Top-Level Ingestion Orchestration ────────────────────────────
 
 def ingest_documents(
@@ -305,11 +510,19 @@ def ingest_documents(
         progress_callback("Building knowledge graph...")
     G = build_knowledge_graph(all_parents, llm_client, progress_callback)
 
+    # Phase 4: Build FABLE hierarchy
+    if progress_callback:
+        progress_callback("Building FABLE hierarchy...")
+    fable_hierarchy = build_fable_hierarchy(
+        all_children, embedding_model, llm_client, progress_callback,
+    )
+
     return {
         "num_parents": len(all_parents),
         "num_children": len(all_children),
         "num_triplets": G.number_of_edges(),
         "num_nodes": G.number_of_nodes(),
+        "fable_clusters": len(fable_hierarchy.get("clusters", {})),
     }
 
 

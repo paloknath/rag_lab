@@ -1,12 +1,14 @@
 """
-Five retrieval strategies using the Strategy Pattern.
+Seven retrieval strategies using the Strategy Pattern.
 
 BaseRetriever (ABC)
 ├── NoRAGRetriever        — Direct LLM call, no context
 ├── VectorRAGRetriever    — Hybrid vector+BM25 search with optional reranking
 ├── GraphRAGRetriever     — Entity extraction + KG N-hop traversal
 ├── HybridRAGRetriever    — Combined Vector + Graph RAG
-└── AgenticRAGRetriever   — LangGraph ReAct agent with vector/graph/verify tools
+├── AgenticRAGRetriever   — LangGraph ReAct agent with vector/graph/verify tools
+├── FABLERetriever        — Hierarchical bi-path retrieval (top-down + bottom-up)
+└── MACERRetriever        — Multi-agent iterative context evolution
 """
 
 import json
@@ -24,7 +26,7 @@ from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
 import config
-from ingestion import load_graph
+from ingestion import load_fable_hierarchy, load_graph
 
 # ── Result Data Class ────────────────────────────────────────────
 
@@ -588,6 +590,428 @@ class AgenticRAGRetriever(BaseRetriever):
         )
 
 
+# ── 6. FABLE RAG (Hierarchical Bi-Path) ──────────────────────────
+
+
+class FABLERetriever(BaseRetriever):
+    """
+    Forest-Based Adaptive Bi-Path Retrieval.
+    Two simultaneous retrieval paths:
+      Path 1 (Top-down): Navigate hierarchy from root summaries to leaf chunks
+      Path 2 (Bottom-up): Standard vector search, then gather parent cluster summaries
+    Merges results from both paths for comprehensive context.
+    """
+
+    def __init__(
+        self,
+        embedding_model: SentenceTransformer,
+        cross_encoder: CrossEncoder | None = None,
+    ):
+        super().__init__()
+        self.embedding_model = embedding_model
+        self.cross_encoder = cross_encoder
+        self.hierarchy = load_fable_hierarchy()
+        self.parent_store = self._load_json(config.PARENT_STORE_PATH, {})
+        self.child_docs = self._load_json(config.CHILD_TEXTS_PATH, [])
+        # Build child_id -> parent_id lookup
+        self._child_to_parent: dict[str, str] = {
+            doc["child_id"]: doc["parent_id"] for doc in self.child_docs
+        }
+
+    def retrieve(self, query: str, **kwargs) -> RetrievalResult:
+        start = time.time()
+        trace: list[str] = []
+        alpha = kwargs.get("alpha", config.HYBRID_ALPHA_DEFAULT)
+        use_reranker = kwargs.get("use_reranker", True)
+        top_k_branches = kwargs.get("top_k_branches", config.FABLE_TOP_K_BRANCHES)
+
+        if not self.hierarchy or not self.hierarchy.get("clusters"):
+            return RetrievalResult(
+                context="", strategy="FABLE RAG",
+                metadata={"error": "FABLE hierarchy not built. Please re-ingest documents."},
+                latency=time.time() - start,
+            )
+
+        clusters = self.hierarchy["clusters"]
+        root = self.hierarchy["root"]
+
+        trace.append(f"[FABLE] Starting bi-path retrieval for: '{query[:80]}...'")
+        trace.append(f"[FABLE] Hierarchy: {len(clusters)} clusters, "
+                     f"{self.hierarchy.get('levels', 1)} levels")
+
+        # ── Path 1: Top-down semantic navigation ──
+        trace.append("\n--- Path 1: Top-Down Semantic Navigation ---")
+        query_embedding = self.embedding_model.encode(query)
+        topdown_child_ids = self._topdown_traverse(
+            query_embedding, root, clusters, top_k_branches, trace,
+        )
+        trace.append(f"[Path 1] Collected {len(topdown_child_ids)} leaf child IDs")
+
+        # ── Path 2: Bottom-up structural search ──
+        trace.append("\n--- Path 2: Bottom-Up Vector Search ---")
+        vector_retriever = VectorRAGRetriever(self.embedding_model, self.cross_encoder)
+        v_result = vector_retriever.retrieve(query, alpha=alpha, use_reranker=use_reranker)
+
+        # Gather child IDs from vector results via parent mapping
+        bottomup_child_ids: list[str] = []
+        for doc in self.child_docs:
+            if doc["parent_id"] in {
+                meta.get("parent_id", "")
+                for cid, _ in []  # placeholder
+            }:
+                pass
+        # Simpler: get parent IDs from vector result, find their child IDs
+        bottomup_parent_ids = set()
+        for chunk in v_result.chunks:
+            for pid, ptext in self.parent_store.items():
+                if ptext == chunk:
+                    bottomup_parent_ids.add(pid)
+                    break
+
+        # Gather cluster summaries for bottom-up path
+        child_to_cluster = self.hierarchy.get("child_to_cluster", {})
+        bottomup_cluster_summaries: list[str] = []
+        seen_clusters: set[str] = set()
+        for doc in self.child_docs:
+            if doc["parent_id"] in bottomup_parent_ids:
+                bottomup_child_ids.append(doc["child_id"])
+                cid = child_to_cluster.get(doc["child_id"], "")
+                if cid and cid not in seen_clusters and cid in clusters:
+                    seen_clusters.add(cid)
+                    bottomup_cluster_summaries.append(clusters[cid]["summary"])
+
+        trace.append(f"[Path 2] Vector search found {v_result.num_chunks} parent chunks")
+        trace.append(f"[Path 2] Mapped to {len(bottomup_child_ids)} child IDs, "
+                     f"{len(bottomup_cluster_summaries)} cluster summaries")
+
+        # ── Merge both paths ──
+        trace.append("\n--- Merging Results ---")
+
+        # Collect all unique parent IDs from both paths
+        all_parent_ids: set[str] = set()
+
+        # From top-down: map child IDs to parent IDs
+        for cid in topdown_child_ids:
+            pid = self._child_to_parent.get(cid, "")
+            if pid:
+                all_parent_ids.add(pid)
+
+        # From bottom-up: already have parent IDs
+        all_parent_ids.update(bottomup_parent_ids)
+
+        # Retrieve parent texts
+        parent_texts = [
+            self.parent_store[pid]
+            for pid in all_parent_ids
+            if pid in self.parent_store
+        ]
+
+        # Also include top-down cluster summaries that were traversed
+        topdown_cluster_summaries: list[str] = []
+        for cid in topdown_child_ids:
+            cluster_id = child_to_cluster.get(cid, "")
+            if cluster_id and cluster_id in clusters and cluster_id not in seen_clusters:
+                seen_clusters.add(cluster_id)
+                topdown_cluster_summaries.append(clusters[cluster_id]["summary"])
+
+        all_cluster_summaries = list(dict.fromkeys(
+            bottomup_cluster_summaries + topdown_cluster_summaries
+        ))
+
+        # Build context: cluster summaries first, then parent chunks
+        context_parts: list[str] = []
+        if all_cluster_summaries:
+            context_parts.append(
+                "Hierarchical Summaries:\n" + "\n\n".join(
+                    f"[Cluster] {s}" for s in all_cluster_summaries
+                )
+            )
+        if parent_texts:
+            context_parts.append(
+                "Source Documents:\n" + "\n\n---\n\n".join(parent_texts)
+            )
+        context = "\n\n".join(context_parts)
+
+        trace.append(f"[Merged] {len(parent_texts)} unique parent chunks, "
+                     f"{len(all_cluster_summaries)} cluster summaries")
+
+        return RetrievalResult(
+            context=context,
+            chunks=parent_texts,
+            num_chunks=len(parent_texts),
+            latency=time.time() - start,
+            strategy="FABLE RAG",
+            trace=trace,
+            metadata={
+                "topdown_leaves": len(topdown_child_ids),
+                "bottomup_leaves": len(bottomup_child_ids),
+                "merged_parents": len(parent_texts),
+                "cluster_summaries_used": len(all_cluster_summaries),
+                "branches_explored": top_k_branches,
+                "hierarchy_levels": self.hierarchy.get("levels", 1),
+            },
+        )
+
+    def _topdown_traverse(
+        self,
+        query_embedding: np.ndarray,
+        root: dict,
+        clusters: dict,
+        top_k_branches: int,
+        trace: list[str],
+    ) -> list[str]:
+        """Navigate the hierarchy top-down, scoring clusters by cosine similarity."""
+        collected_child_ids: list[str] = []
+        current_candidates = root.get("children", [])
+
+        if not current_candidates:
+            return collected_child_ids
+
+        level = 0
+        while current_candidates:
+            level += 1
+            # Score each candidate cluster
+            scored: list[tuple[str, float]] = []
+            for cluster_id in current_candidates:
+                cluster_info = clusters.get(cluster_id, {})
+                emb = cluster_info.get("summary_embedding")
+                if emb:
+                    emb_arr = np.array(emb)
+                    norm_q = np.linalg.norm(query_embedding)
+                    norm_e = np.linalg.norm(emb_arr)
+                    if norm_q > 0 and norm_e > 0:
+                        sim = float(np.dot(query_embedding, emb_arr) / (norm_q * norm_e))
+                    else:
+                        sim = 0.0
+                    scored.append((cluster_id, sim))
+                else:
+                    scored.append((cluster_id, 0.0))
+
+            scored.sort(key=lambda x: x[1], reverse=True)
+            selected = scored[:top_k_branches]
+
+            trace.append(
+                f"[Path 1] Level {level}: scored {len(scored)} clusters, "
+                f"selected top-{len(selected)}: "
+                + ", ".join(f"{cid}({sim:.3f})" for cid, sim in selected)
+            )
+
+            next_candidates: list[str] = []
+            for cluster_id, _ in selected:
+                cluster_info = clusters.get(cluster_id, {})
+                sub_children = cluster_info.get("children", [])
+                if sub_children:
+                    next_candidates.extend(sub_children)
+                else:
+                    leaf_ids = cluster_info.get("leaf_child_ids", [])
+                    collected_child_ids.extend(leaf_ids)
+
+            current_candidates = next_candidates
+
+        return collected_child_ids
+
+    @staticmethod
+    def _load_json(path: str, default=None):
+        if not os.path.exists(path):
+            return default if default is not None else {}
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+
+# ── 7. MACER RAG (Multi-Agent Context Evolution) ────────────────
+
+
+class MACERRetriever(BaseRetriever):
+    """
+    Multi-Agent Context Evolution and Retrieval.
+    Four-agent iterative loop:
+      1. Retriever: finds chunks via vector + graph search
+      2. Constructor: extracts key facts and relationships from new chunks
+      3. Reflector: evaluates context quality, identifies gaps, refines query
+      4. Response: synthesizes final answer when context is sufficient
+    """
+
+    def __init__(
+        self,
+        embedding_model: SentenceTransformer,
+        cross_encoder: CrossEncoder | None = None,
+    ):
+        super().__init__()
+        self.embedding_model = embedding_model
+        self.cross_encoder = cross_encoder
+
+    def retrieve(self, query: str, **kwargs) -> RetrievalResult:
+        start = time.time()
+        trace: list[str] = []
+        max_iterations = kwargs.get("max_iterations", config.MACER_MAX_ITERATIONS)
+        alpha = kwargs.get("alpha", config.HYBRID_ALPHA_DEFAULT)
+        use_reranker = kwargs.get("use_reranker", True)
+        hops = kwargs.get("hops", config.GRAPH_HOPS_DEFAULT)
+
+        # Build internal retrievers
+        vector_retriever = VectorRAGRetriever(self.embedding_model, self.cross_encoder)
+        graph_retriever = GraphRAGRetriever()
+
+        # Accumulated state across iterations
+        all_facts: list[str] = []
+        all_chunks: list[str] = []
+        seen_chunk_keys: set[str] = set()
+        current_query = query
+        termination_reason = "max_iterations"
+        total_llm_calls = 0
+        iteration = 0
+
+        trace.append(f"[MACER] Starting with query: '{query}'")
+        trace.append(f"[MACER] Max iterations: {max_iterations}")
+
+        for iteration in range(1, max_iterations + 1):
+            trace.append(f"\n--- Iteration {iteration}/{max_iterations} ---")
+
+            # ── Agent 1: RETRIEVER ──
+            trace.append(f"[Iter {iteration}] Retriever: searching with query='{current_query[:80]}...'")
+
+            v_result = vector_retriever.retrieve(
+                current_query, alpha=alpha, use_reranker=use_reranker,
+            )
+            g_result = graph_retriever.retrieve(current_query, hops=hops)
+
+            # Collect new chunks (deduped)
+            new_chunks: list[str] = []
+            for chunk in v_result.chunks + g_result.chunks:
+                chunk_key = chunk[:200]
+                if chunk_key not in seen_chunk_keys:
+                    seen_chunk_keys.add(chunk_key)
+                    new_chunks.append(chunk)
+                    all_chunks.append(chunk)
+
+            new_triplets = g_result.metadata.get("triplets", [])
+            trace.append(
+                f"[Iter {iteration}] Retriever: found {len(new_chunks)} new chunks, "
+                f"{len(new_triplets)} graph triplets"
+            )
+
+            if not new_chunks and not new_triplets:
+                trace.append(f"[Iter {iteration}] Retriever: no new information found, ending loop")
+                termination_reason = "no_new_info"
+                break
+
+            # ── Agent 2: CONSTRUCTOR ──
+            trace.append(f"[Iter {iteration}] Constructor: extracting key facts...")
+            constructor_input = "\n\n---\n\n".join(new_chunks)[:3000]
+            if new_triplets:
+                constructor_input += "\n\nGraph relationships:\n" + "\n".join(new_triplets[:20])
+
+            constructor_response = self.llm_client.chat.completions.create(
+                model=config.LLM_MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": (
+                        "You are a fact extraction assistant. Given retrieved passages and graph "
+                        "relationships, extract the key facts and relationships as a numbered list. "
+                        "Be concise. Each fact should be a single sentence."
+                    )},
+                    {"role": "user", "content": (
+                        f"Original question: {query}\n\n"
+                        f"Retrieved content:\n{constructor_input}\n\n"
+                        "Extract key facts (numbered list):"
+                    )},
+                ],
+                temperature=0.0,
+                max_tokens=512,
+                seed=random.randint(0, 2**31),
+            )
+            total_llm_calls += 1
+
+            new_facts_text = constructor_response.choices[0].message.content.strip()
+            new_facts = [
+                line.strip().lstrip("0123456789.-) ")
+                for line in new_facts_text.split("\n")
+                if line.strip() and any(c.isalpha() for c in line)
+            ]
+            all_facts.extend(new_facts)
+            trace.append(f"[Iter {iteration}] Constructor: extracted {len(new_facts)} facts")
+
+            # ── Agent 3: REFLECTOR ──
+            trace.append(f"[Iter {iteration}] Reflector: evaluating context sufficiency...")
+
+            facts_summary = "\n".join(f"- {f}" for f in all_facts[-20:])
+            reflector_response = self.llm_client.chat.completions.create(
+                model=config.LLM_MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": (
+                        "You are a context quality evaluator. Given the original question and "
+                        "accumulated facts, determine:\n"
+                        "1. Is the context SUFFICIENT to answer the question? (yes/no)\n"
+                        "2. What information gaps remain?\n"
+                        "3. If not sufficient, provide a refined follow-up query to fill the gaps.\n\n"
+                        "Respond in this exact format:\n"
+                        "SUFFICIENT: yes/no\n"
+                        "GAPS: <description of missing info, or 'none'>\n"
+                        "REFINED_QUERY: <new query to fill gaps, or 'none'>"
+                    )},
+                    {"role": "user", "content": (
+                        f"Original question: {query}\n\n"
+                        f"Accumulated facts:\n{facts_summary}\n\n"
+                        "Evaluate:"
+                    )},
+                ],
+                temperature=0.0,
+                max_tokens=300,
+                seed=random.randint(0, 2**31),
+            )
+            total_llm_calls += 1
+
+            reflector_text = reflector_response.choices[0].message.content.strip()
+            trace.append(f"[Iter {iteration}] Reflector response:\n{reflector_text}")
+
+            # Parse reflector output
+            is_sufficient = "sufficient: yes" in reflector_text.lower()
+            refined_query = current_query
+
+            for line in reflector_text.split("\n"):
+                line_stripped = line.strip()
+                if line_stripped.lower().startswith("refined_query:"):
+                    rq = line_stripped[len("refined_query:"):].strip()
+                    if rq and rq.lower() != "none":
+                        refined_query = rq
+
+            if is_sufficient:
+                trace.append(f"[Iter {iteration}] Reflector: context is SUFFICIENT, ending loop")
+                termination_reason = "sufficient"
+                break
+            else:
+                trace.append(f"[Iter {iteration}] Reflector: context insufficient, refining query")
+                trace.append(f"[Iter {iteration}] New query: '{refined_query[:80]}...'")
+                current_query = refined_query
+
+        # ── Build final context ──
+        context_parts: list[str] = []
+        if all_facts:
+            context_parts.append("Key Facts:\n" + "\n".join(f"- {f}" for f in all_facts))
+        if all_chunks:
+            context_parts.append("Supporting Documents:\n" + "\n\n---\n\n".join(all_chunks))
+        context = "\n\n".join(context_parts)
+
+        trace.append(f"\n[MACER] Complete: {iteration} iterations, {len(all_facts)} facts, "
+                     f"{len(all_chunks)} chunks, {total_llm_calls} LLM calls")
+
+        return RetrievalResult(
+            context=context,
+            chunks=all_chunks,
+            num_chunks=len(all_chunks),
+            latency=time.time() - start,
+            strategy="MACER RAG",
+            trace=trace,
+            metadata={
+                "iterations_completed": iteration,
+                "max_iterations": max_iterations,
+                "termination_reason": termination_reason,
+                "total_facts": len(all_facts),
+                "total_llm_calls": total_llm_calls,
+                "facts": all_facts,
+            },
+        )
+
+
 # ── Factory ──────────────────────────────────────────────────────
 
 
@@ -607,5 +1031,9 @@ def get_retriever(
         return HybridRAGRetriever(embedding_model, cross_encoder)
     elif mode == "Agentic RAG":
         return AgenticRAGRetriever(embedding_model, cross_encoder)
+    elif mode == "FABLE RAG":
+        return FABLERetriever(embedding_model, cross_encoder)
+    elif mode == "MACER RAG":
+        return MACERRetriever(embedding_model, cross_encoder)
     else:
         raise ValueError(f"Unknown retrieval mode: {mode}")

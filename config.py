@@ -26,6 +26,7 @@ CHUNK_OVERLAP = 50                   # Token overlap between chunks
 TOP_K_RETRIEVAL = 10                 # Initial candidates from vector/BM25
 TOP_K_RERANK = 5                     # Final results after cross-encoder reranking
 HYBRID_ALPHA_DEFAULT = 0.5           # 1.0 = pure vector, 0.0 = pure BM25
+GRAPH_HOPS_DEFAULT = 1               # Number of hops for graph traversal (1–3)
 
 # ── LLM Generation ──────────────────────────────────────────────
 LLM_TEMPERATURE = 0.1

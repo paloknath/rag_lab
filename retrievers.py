@@ -4,7 +4,7 @@ Five retrieval strategies using the Strategy Pattern.
 BaseRetriever (ABC)
 ├── NoRAGRetriever        — Direct LLM call, no context
 ├── VectorRAGRetriever    — Hybrid vector+BM25 search with optional reranking
-├── GraphRAGRetriever     — Entity extraction + KG 1-hop traversal
+├── GraphRAGRetriever     — Entity extraction + KG N-hop traversal
 ├── HybridRAGRetriever    — Combined Vector + Graph RAG
 └── AgenticRAGRetriever   — LangGraph ReAct agent with vector/graph/verify tools
 """
@@ -263,7 +263,7 @@ class VectorRAGRetriever(BaseRetriever):
 class GraphRAGRetriever(BaseRetriever):
     """
     Extract entities from the query, traverse the Knowledge Graph for
-    1-hop neighbors, and retrieve the corresponding text chunks.
+    N-hop neighbors, and retrieve the corresponding text chunks.
     """
 
     def __init__(self):
@@ -273,6 +273,7 @@ class GraphRAGRetriever(BaseRetriever):
 
     def retrieve(self, query: str, **kwargs) -> RetrievalResult:
         start = time.time()
+        hops = kwargs.get("hops", config.GRAPH_HOPS_DEFAULT)
 
         if self.graph.number_of_nodes() == 0:
             return RetrievalResult(
@@ -292,23 +293,45 @@ class GraphRAGRetriever(BaseRetriever):
                 latency=time.time() - start,
             )
 
-        # --- 1-hop graph traversal ---
+        # --- N-hop graph traversal (BFS) ---
         triplets: list[str] = []
         chunk_ids: set[str] = set()
+        visited_edges: set[tuple[str, str, str]] = set()
 
-        for entity in matched_entities:
-            # Outgoing edges
-            for _, target, data in self.graph.out_edges(entity, data=True):
-                rel = data.get("relation", "related_to")
-                triplets.append(f"{entity} -[{rel}]-> {target}")
-                if "source_chunk" in data:
-                    chunk_ids.add(data["source_chunk"])
-            # Incoming edges
-            for source, _, data in self.graph.in_edges(entity, data=True):
-                rel = data.get("relation", "related_to")
-                triplets.append(f"{source} -[{rel}]-> {entity}")
-                if "source_chunk" in data:
-                    chunk_ids.add(data["source_chunk"])
+        # Start BFS from matched entities
+        current_nodes: set[str] = set(matched_entities)
+        visited_nodes: set[str] = set(matched_entities)
+
+        for hop in range(hops):
+            next_nodes: set[str] = set()
+            for node in current_nodes:
+                # Outgoing edges
+                for _, target, data in self.graph.out_edges(node, data=True):
+                    rel = data.get("relation", "related_to")
+                    edge_key = (node, rel, target)
+                    if edge_key not in visited_edges:
+                        visited_edges.add(edge_key)
+                        triplets.append(f"{node} -[{rel}]-> {target}")
+                        if "source_chunk" in data:
+                            chunk_ids.add(data["source_chunk"])
+                    if target not in visited_nodes:
+                        next_nodes.add(target)
+                # Incoming edges
+                for source, _, data in self.graph.in_edges(node, data=True):
+                    rel = data.get("relation", "related_to")
+                    edge_key = (source, rel, node)
+                    if edge_key not in visited_edges:
+                        visited_edges.add(edge_key)
+                        triplets.append(f"{source} -[{rel}]-> {node}")
+                        if "source_chunk" in data:
+                            chunk_ids.add(data["source_chunk"])
+                    if source not in visited_nodes:
+                        next_nodes.add(source)
+
+            visited_nodes.update(next_nodes)
+            current_nodes = next_nodes
+            if not current_nodes:
+                break
 
         # --- Retrieve parent texts for graph-connected chunks ---
         parent_texts = [
@@ -329,11 +352,12 @@ class GraphRAGRetriever(BaseRetriever):
             chunks=parent_texts,
             num_chunks=len(parent_texts),
             latency=time.time() - start,
-            strategy="Graph RAG",
+            strategy=f"Graph RAG ({hops}-hop)",
             metadata={
                 "matched_entities": matched_entities,
                 "triplets": triplets,
                 "num_triplets": len(triplets),
+                "hops": hops,
             },
         )
 
@@ -389,7 +413,9 @@ class HybridRAGRetriever(BaseRetriever):
             alpha=kwargs.get("alpha", config.HYBRID_ALPHA_DEFAULT),
             use_reranker=kwargs.get("use_reranker", True),
         )
-        g_result = self.graph_retriever.retrieve(query)
+        g_result = self.graph_retriever.retrieve(
+            query, hops=kwargs.get("hops", config.GRAPH_HOPS_DEFAULT),
+        )
 
         # Merge and deduplicate chunks
         seen = set()

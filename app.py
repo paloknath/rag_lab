@@ -60,6 +60,8 @@ def _display_metrics(metrics: dict, trace: list[str] | None = None):
             )
 
         # Graph RAG details
+        if "hops" in meta:
+            st.caption(f"🔗 Graph hops: {meta['hops']}")
         if "matched_entities" in meta:
             st.caption(f"🔍 Matched entities: {', '.join(meta['matched_entities'])}")
         if "triplets" in meta:
@@ -206,6 +208,7 @@ with st.sidebar:
     # Conditional settings for modes that use vector search
     use_reranker = False
     hybrid_alpha = config.HYBRID_ALPHA_DEFAULT
+    graph_hops = config.GRAPH_HOPS_DEFAULT
 
     if rag_mode in ("Vector RAG", "Vector + Graph RAG"):
         use_reranker = st.toggle(
@@ -217,6 +220,14 @@ with st.sidebar:
             min_value=0.0, max_value=1.0,
             value=config.HYBRID_ALPHA_DEFAULT, step=0.05,
             help="1.0 = pure vector search, 0.0 = pure BM25 keyword search",
+        )
+
+    if rag_mode in ("Graph RAG", "Vector + Graph RAG"):
+        graph_hops = st.slider(
+            "Graph Traversal Hops",
+            min_value=1, max_value=3,
+            value=config.GRAPH_HOPS_DEFAULT, step=1,
+            help="Number of hops from matched entities. More hops = broader context but may include less relevant info.",
         )
 
     if rag_mode == "Agentic RAG":
@@ -279,6 +290,7 @@ if prompt := st.chat_input("Ask a question about your documents..."):
             else:
                 result = retriever.retrieve(
                     prompt, alpha=hybrid_alpha, use_reranker=use_reranker,
+                    hops=graph_hops,
                 )
                 answer = retriever.generate_answer(prompt, result.context)
 

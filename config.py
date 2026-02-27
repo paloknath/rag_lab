@@ -12,7 +12,7 @@ EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 # ── Storage Paths ────────────────────────────────────────────────
-VECTOR_STORE_PATH = "./vector_store/vectors.npz"
+CHROMA_DB_PATH = "./chroma_db"
 GRAPH_STORE_PATH = "./graph_store/kg.json"
 PARENT_STORE_PATH = "./graph_store/parents.json"
 CHILD_TEXTS_PATH = "./graph_store/child_texts.json"
@@ -31,3 +31,5 @@ HYBRID_ALPHA_DEFAULT = 0.5           # 1.0 = pure vector, 0.0 = pure BM25
 LLM_TEMPERATURE = 0.1
 LLM_MAX_TOKENS = 1024
 
+# ── ChromaDB ─────────────────────────────────────────────────────
+CHROMA_COLLECTION_NAME = "rag_playground"

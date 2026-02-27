@@ -1,18 +1,19 @@
 """
 Data ingestion pipeline: document loading, parent-child chunking,
-numpy vector storage, BM25 index building, and Knowledge Graph extraction.
+ChromaDB storage, BM25 index building, and Knowledge Graph extraction.
 """
 
 import json
 import os
+import random
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+import chromadb
 import fitz  # PyMuPDF
 import networkx as nx
-import numpy as np
 import tiktoken
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer
@@ -122,30 +123,46 @@ def chunk_document(
     return parent_dict, children
 
 
-# ── Numpy Vector Store ───────────────────────────────────────────
+# ── ChromaDB Storage ─────────────────────────────────────────────
+
+def get_chroma_client() -> chromadb.PersistentClient:
+    """Get or create the persistent ChromaDB client."""
+    return chromadb.PersistentClient(path=config.CHROMA_DB_PATH)
+
 
 def store_chunks(
     children: list[ChildChunk],
     parent_dict: dict[str, str],
     embedding_model: SentenceTransformer,
 ) -> None:
-    """Embed child chunks and store as numpy arrays on disk."""
+    """Embed child chunks and store in ChromaDB. Save parent dict and child texts."""
     if not children:
         return
 
+    client = get_chroma_client()
+    collection = client.get_or_create_collection(
+        name=config.CHROMA_COLLECTION_NAME,
+        metadata={"hnsw:space": "cosine"},
+    )
+
     # Embed all child texts
     texts = [c.text for c in children]
-    new_embeddings = embedding_model.encode(texts, show_progress_bar=False)
+    embeddings = embedding_model.encode(texts, show_progress_bar=False).tolist()
 
-    # Load existing vectors if present
-    _ensure_dir(config.VECTOR_STORE_PATH)
-    if os.path.exists(config.VECTOR_STORE_PATH):
-        data = np.load(config.VECTOR_STORE_PATH, allow_pickle=False)
-        existing_embeddings = data["embeddings"]
-        new_embeddings = np.vstack([existing_embeddings, new_embeddings])
-
-    # Save embeddings
-    np.savez_compressed(config.VECTOR_STORE_PATH, embeddings=new_embeddings)
+    # Upsert into ChromaDB
+    collection.upsert(
+        ids=[c.child_id for c in children],
+        embeddings=embeddings,
+        documents=texts,
+        metadatas=[
+            {
+                "parent_id": c.parent_id,
+                "source_file": c.source_file,
+                "chunk_index": c.chunk_index,
+            }
+            for c in children
+        ],
+    )
 
     # Persist parent chunks to JSON
     _ensure_dir(config.PARENT_STORE_PATH)
@@ -153,47 +170,14 @@ def store_chunks(
     existing_parents.update(parent_dict)
     _save_json(config.PARENT_STORE_PATH, existing_parents)
 
-    # Persist child metadata for BM25 and retrieval
+    # Persist child texts for BM25 index rebuilding
     existing_children = _load_json(config.CHILD_TEXTS_PATH, default=[])
     existing_children.extend([
-        {
-            "child_id": c.child_id,
-            "text": c.text,
-            "parent_id": c.parent_id,
-            "source_file": c.source_file,
-        }
+        {"child_id": c.child_id, "text": c.text, "parent_id": c.parent_id,
+         "source_file": c.source_file}
         for c in children
     ])
     _save_json(config.CHILD_TEXTS_PATH, existing_children)
-
-
-def vector_search(
-    query_embedding: np.ndarray, top_k: int = 10
-) -> list[tuple[int, float]]:
-    """
-    Cosine similarity search against stored vectors.
-    Returns list of (index, similarity_score) tuples, highest first.
-    """
-    if not os.path.exists(config.VECTOR_STORE_PATH):
-        return []
-
-    data = np.load(config.VECTOR_STORE_PATH, allow_pickle=False)
-    embeddings = data["embeddings"]
-
-    if embeddings.shape[0] == 0:
-        return []
-
-    # Cosine similarity: dot product of normalized vectors
-    query_norm = query_embedding / (np.linalg.norm(query_embedding) + 1e-10)
-    norms = np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-10
-    normalized = embeddings / norms
-    similarities = normalized @ query_norm
-
-    # Get top-k indices
-    k = min(top_k, len(similarities))
-    top_indices = np.argsort(similarities)[::-1][:k]
-
-    return [(int(idx), float(similarities[idx])) for idx in top_indices]
 
 
 # ── Knowledge Graph Extraction ───────────────────────────────────
@@ -224,6 +208,7 @@ def extract_triplets(text: str, llm_client: OpenAI) -> list[tuple[str, str, str]
             ],
             temperature=0.0,
             max_tokens=1024,
+            seed=random.randint(0, 2**31),
         )
         content = response.choices[0].message.content.strip()
         # Try to extract JSON from the response
@@ -310,7 +295,7 @@ def ingest_documents(
         all_parents.update(parent_dict)
         all_children.extend(children)
 
-    # Phase 2: Embed and store vectors
+    # Phase 2: Embed and store in ChromaDB
     if progress_callback:
         progress_callback("Embedding and storing chunks...")
     store_chunks(all_children, all_parents, embedding_model)
@@ -329,9 +314,9 @@ def ingest_documents(
 
 
 def clear_all_data() -> None:
-    """Remove all ingested data (vectors, graph, parent store)."""
+    """Remove all ingested data (ChromaDB, graph, parent store)."""
     import shutil
-    for dir_path in ("vector_store", "graph_store"):
+    for dir_path in (config.CHROMA_DB_PATH, "graph_store"):
         if os.path.exists(dir_path):
             shutil.rmtree(dir_path)
 

@@ -27,9 +27,9 @@ st.set_page_config(
 # ── Helper Functions ─────────────────────────────────────────────
 
 def _check_ingested() -> bool:
-    """Check if documents have been ingested (vector store + parent store exist)."""
+    """Check if documents have been ingested (ChromaDB + parent store exist)."""
     return (
-        os.path.exists(config.VECTOR_STORE_PATH)
+        os.path.exists(config.CHROMA_DB_PATH)
         and os.path.exists(config.PARENT_STORE_PATH)
     )
 
@@ -51,6 +51,13 @@ def _display_metrics(metrics: dict, trace: list[str] | None = None):
         sources = meta.get("sources", [])
         if sources:
             st.caption(f"📄 Sources: {', '.join(sources)}")
+
+        # Vector + Graph RAG breakdown
+        if "vector_chunks" in meta and "graph_chunks" in meta:
+            st.caption(
+                f"🔎 Vector: {meta['vector_chunks']} chunks | "
+                f"🕸️ Graph: {meta['graph_chunks']} chunks"
+            )
 
         # Graph RAG details
         if "matched_entities" in meta:
@@ -185,21 +192,22 @@ with st.sidebar:
 
     rag_mode = st.selectbox(
         "Retrieval Mode",
-        options=["No RAG", "Vector RAG", "Graph RAG", "Agentic RAG"],
+        options=["No RAG", "Vector RAG", "Graph RAG", "Vector + Graph RAG", "Agentic RAG"],
         index=1,
         help=(
             "**No RAG**: Direct LLM call\n\n"
             "**Vector RAG**: Hybrid vector+BM25 search with optional reranking\n\n"
             "**Graph RAG**: Knowledge graph entity traversal\n\n"
+            "**Vector + Graph RAG**: Combined vector search + graph traversal\n\n"
             "**Agentic RAG**: Autonomous agent with multiple tools"
         ),
     )
 
-    # Conditional settings for Vector RAG
+    # Conditional settings for modes that use vector search
     use_reranker = False
     hybrid_alpha = config.HYBRID_ALPHA_DEFAULT
 
-    if rag_mode == "Vector RAG":
+    if rag_mode in ("Vector RAG", "Vector + Graph RAG"):
         use_reranker = st.toggle(
             "Cross-Encoder Reranking", value=True,
             help="Rerank top results using a cross-encoder model for better precision.",
@@ -241,7 +249,7 @@ if prompt := st.chat_input("Ask a question about your documents..."):
 
     # Generate assistant response
     with st.chat_message("assistant"):
-        needs_data = rag_mode in ("Vector RAG", "Graph RAG", "Agentic RAG")
+        needs_data = rag_mode in ("Vector RAG", "Graph RAG", "Vector + Graph RAG", "Agentic RAG")
 
         if needs_data and not st.session_state.ingested:
             st.warning("⚠️ Please ingest documents first for this retrieval mode.")
@@ -266,11 +274,8 @@ if prompt := st.chat_input("Ask a question about your documents..."):
                         label=f"Agent complete ({result.latency:.2f}s)",
                         state="complete",
                     )
-                # Use agent's own answer if available
-                if result.metadata.get("agent_answer"):
-                    answer = result.metadata["agent_answer"]
-                else:
-                    answer = retriever.generate_answer(prompt, result.context)
+                # Always generate a synthesized answer from the gathered context
+                answer = retriever.generate_answer(prompt, result.context)
             else:
                 result = retriever.retrieve(
                     prompt, alpha=hybrid_alpha, use_reranker=use_reranker,

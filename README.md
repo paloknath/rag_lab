@@ -1,4 +1,6 @@
-# RAG Playground
+# RAG Lab
+
+RAG Lab introduces a closed-loop retrieval intelligence framework that augments conventional RAG pipelines with post-hoc evaluation, causal diagnosis, and optimization guidance.
 
 A modular Streamlit app to compare seven Retrieval-Augmented Generation strategies side-by-side:
 
@@ -14,7 +16,9 @@ A modular Streamlit app to compare seven Retrieval-Augmented Generation strategi
 
 ## Why?
 
-This is a **demonstration tool** to make it easy to see *when and why* different RAG strategies shine. Graph RAG excels at relational queries ("Who founded X?"), Vector RAG at semantic similarity, Agentic RAG at multi-step reasoning, and MACER at progressively refining context when one pass isn't enough.
+Most RAG systems stop at generation. RAG Lab closes the loop: after every response it evaluates what was retrieved, diagnoses *why* quality was high or low, and surfaces concrete configuration changes to improve the next run — without any manual inspection.
+
+The seven retrieval strategies serve as a comparison surface. Graph RAG excels at relational queries ("Who founded X?"), Vector RAG at semantic similarity, Agentic RAG at multi-step reasoning, and MACER at progressively refining context when one pass isn't enough. The closed-loop layer — LLM-as-a-Judge, noise analysis, efficiency metrics, and optimization suggestions — applies equally to all of them.
 
 ## Tech Stack
 

@@ -123,9 +123,48 @@ def _display_metrics(metrics: dict, trace: list[str] | None = None):
                 st.text(step)
 
 
-def _display_evaluation(eval_data: dict):
+def _display_noise_analysis(noise_data: dict):
+    """Render Context Noise Analysis results in an expander."""
+    with st.expander("🔍 Context Noise Analysis", expanded=False):
+        noise_ratio = noise_data["noise_ratio"]
+        relevant = noise_data["relevant_count"]
+        partial = noise_data["partial_count"]
+        irrelevant = noise_data["irrelevant_count"]
+        total = relevant + partial + irrelevant
+
+        cols = st.columns(4)
+        with cols[0]:
+            color = "🔴" if noise_ratio > 0.5 else "🟡" if noise_ratio > 0.2 else "🟢"
+            st.metric("Noise Ratio", f"{color} {noise_ratio:.0%}")
+        with cols[1]:
+            st.metric("Relevant", relevant)
+        with cols[2]:
+            st.metric("Partial", partial)
+        with cols[3]:
+            st.metric("Irrelevant", irrelevant)
+
+        if total == 0:
+            st.caption("No chunks to analyse.")
+            return
+
+        st.divider()
+        for detail in noise_data["details"]:
+            cid = detail["chunk_id"]
+            relevance = detail["relevance"]
+            reason = detail["reason"]
+            label = f"**{cid}** — {reason}"
+            if relevance == "irrelevant":
+                st.error(label, icon="❌")
+            elif relevance == "partial":
+                st.warning(label, icon="⚠️")
+            else:
+                st.success(label, icon="✅")
+
+
+def _display_evaluation(eval_data: dict, retrieval_metrics: dict | None = None):
     """Render LLM-as-a-Judge evaluation scores in an expander."""
-    from evaluation import EvaluationResult
+    from evaluation import EvaluationResult, compute_retrieval_efficiency
+    from recommendations import generate_retrieval_recommendations
 
     eval_result = EvaluationResult.from_dict(eval_data)
 
@@ -134,13 +173,13 @@ def _display_evaluation(eval_data: dict):
             st.warning(f"Evaluation error: {eval_result.error}")
             return
 
-        metrics = [
+        scores = [
             eval_result.context_relevance,
             eval_result.context_sufficiency,
             eval_result.faithfulness,
             eval_result.answer_relevance,
         ]
-        applicable = [m for m in metrics if m.applicable]
+        applicable = [m for m in scores if m.applicable]
 
         cols = st.columns(len(applicable))
         for col, metric in zip(cols, applicable):
@@ -151,16 +190,36 @@ def _display_evaluation(eval_data: dict):
                 else:
                     st.metric(metric.name, "N/A")
 
+        # Derived retrieval efficiency (no extra LLM calls)
+        efficiency = compute_retrieval_efficiency(eval_result)
+        if efficiency.get("applicable"):
+            ratio = efficiency["efficiency_ratio"]
+            indicator = efficiency["noise_indicator"]
+            emoji = "🟢" if ratio >= 0.9 else "🟡" if ratio >= 0.6 else "🔴"
+            eff_col, interp_col = st.columns([1, 3])
+            with eff_col:
+                st.metric("Retrieval Efficiency", f"{emoji} {ratio:.2f} — {indicator}")
+            with interp_col:
+                st.caption(efficiency["interpretation"])
+
         for metric in applicable:
             if metric.score is not None:
                 st.caption(f"**{metric.name}**: {metric.reason}")
 
-        not_applicable = [m for m in metrics if not m.applicable]
+        not_applicable = [m for m in scores if not m.applicable]
         if not_applicable:
             names = ", ".join(m.name for m in not_applicable)
             st.caption(f"_{names}: Not applicable (no retrieval performed)_")
 
         st.caption(f"Judge latency: {eval_result.latency:.2f}s")
+
+    # Optimization suggestions expander (outside the evaluation expander)
+    if retrieval_metrics:
+        suggestions = generate_retrieval_recommendations(eval_result, retrieval_metrics)
+        if suggestions:
+            with st.expander("💡 Optimization Suggestions", expanded=False):
+                for suggestion in suggestions:
+                    st.markdown(f"- {suggestion}")
 
 
 # ── Cached Resources ─────────────────────────────────────────────
@@ -344,6 +403,11 @@ with st.sidebar:
         value=False,
         help="Run automatic quality evaluation after each query using the LLM as judge. Adds ~3-6s latency.",
     )
+    enable_noise_analysis = st.toggle(
+        "Context Noise Analysis",
+        value=False,
+        help="Evaluate per-chunk relevance after each query. Adds ~2-4s latency.",
+    )
 
     st.divider()
 
@@ -363,7 +427,9 @@ for msg in st.session_state.messages:
         if msg["role"] == "assistant" and "metrics" in msg:
             _display_metrics(msg["metrics"], msg.get("trace"))
         if msg["role"] == "assistant" and "evaluation" in msg:
-            _display_evaluation(msg["evaluation"])
+            _display_evaluation(msg["evaluation"], msg.get("metrics"))
+        if msg["role"] == "assistant" and "noise_analysis" in msg:
+            _display_noise_analysis(msg["noise_analysis"])
 
 # Handle new user input
 if prompt := st.chat_input("Ask a question about your documents..."):
@@ -476,7 +542,15 @@ if prompt := st.chat_input("Ask a question about your documents..."):
                     answer=answer,
                     strategy=rag_mode,
                 )
-            _display_evaluation(eval_result.to_dict())
+            _display_evaluation(eval_result.to_dict(), metrics)
+
+        # Run Context Noise Analysis if enabled (after answer is already rendered)
+        noise_result = None
+        if enable_noise_analysis and result and result.chunks:
+            with st.spinner("Analysing context noise..."):
+                from noise_analysis import analyze_context_noise
+                noise_result = analyze_context_noise(prompt, result.chunks)
+            _display_noise_analysis(noise_result.to_dict())
 
         # Persist to session state
         msg_data = {"role": "assistant", "content": answer}
@@ -486,4 +560,6 @@ if prompt := st.chat_input("Ask a question about your documents..."):
             msg_data["trace"] = trace
         if eval_result:
             msg_data["evaluation"] = eval_result.to_dict()
+        if noise_result:
+            msg_data["noise_analysis"] = noise_result.to_dict()
         st.session_state.messages.append(msg_data)

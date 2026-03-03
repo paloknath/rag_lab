@@ -71,6 +71,64 @@ class EvaluationResult:
         )
 
 
+# ── Derived Metrics ────────────────────────────────────────────
+
+
+def compute_retrieval_efficiency(eval_result: "EvaluationResult") -> dict:
+    """
+    Derive a retrieval efficiency signal from existing judge scores.
+    No additional LLM calls — purely arithmetic over context_relevance
+    and context_sufficiency.
+
+    efficiency_ratio = min(relevance / sufficiency, 1.0)
+
+    Noise indicator thresholds:
+        >= 0.9  →  Precise Retrieval
+        0.6–0.9 →  Moderate Precision
+        < 0.6   →  Noisy Retrieval
+
+    Returns a dict with keys: applicable, efficiency_ratio,
+    noise_indicator, interpretation.
+    """
+    rel = eval_result.context_relevance
+    suf = eval_result.context_sufficiency
+
+    if (
+        not rel.applicable
+        or not suf.applicable
+        or rel.score is None
+        or suf.score is None
+        or suf.score == 0
+    ):
+        return {"applicable": False}
+
+    ratio = round(min(rel.score / suf.score, 1.0), 2)
+
+    if ratio >= 0.9:
+        indicator = "Precise Retrieval"
+        interpretation = (
+            "Retrieved content closely matches what is needed to answer the query."
+        )
+    elif ratio >= 0.6:
+        indicator = "Moderate Precision"
+        interpretation = (
+            "Retrieved content is partially relevant but some gaps or noise remain."
+        )
+    else:
+        indicator = "Noisy Retrieval"
+        interpretation = (
+            "Significant mismatch between relevance and sufficiency — "
+            "retrieval may include off-topic or insufficient content."
+        )
+
+    return {
+        "applicable": True,
+        "efficiency_ratio": ratio,
+        "noise_indicator": indicator,
+        "interpretation": interpretation,
+    }
+
+
 # ── Judge Prompts ──────────────────────────────────────────────
 
 
